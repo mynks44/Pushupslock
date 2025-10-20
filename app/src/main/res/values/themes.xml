@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.PushupLock" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- AppCompat-compatible theme for AppCompatActivity -->
+    <style name="Theme.PushupLock" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <!-- You can add overrides later. Keeping it minimal avoids version gotchas. -->
+        <!-- Example (optional):
+        <item name="colorPrimary">@android:color/black</item>
+        -->
+    </style>
+
 </resources>

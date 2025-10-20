@@ -31,18 +31,18 @@ android {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
     }
-
     kotlinOptions {
         jvmTarget = "11"
     }
 
     buildFeatures {
         compose = true
-        viewBinding = true
+        viewBinding = true  
     }
 }
 
 dependencies {
+    // ---- AndroidX + Compose base (from your TOML) ----
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
@@ -51,33 +51,29 @@ dependencies {
     implementation(libs.androidx.ui.graphics)
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
-    implementation(libs.vision.common)
     implementation(libs.androidx.appcompat)
-    implementation(libs.pose.detection.common)
     implementation(libs.androidx.recyclerview)
 
-    val camerax_version = "1.2.2"
+    // implementation(libs.vision.common)
+    // implementation(libs.pose.detection.common)
+
+    val camerax_version = "1.3.4"
     implementation("androidx.camera:camera-core:$camerax_version")
     implementation("androidx.camera:camera-camera2:$camerax_version")
     implementation("androidx.camera:camera-lifecycle:$camerax_version")
     implementation("androidx.camera:camera-view:$camerax_version")
 
-    // ML Kit Pose Detection - required for AccuratePoseDetectorOptions
-    implementation("com.google.mlkit:pose-detection:18.0.0-beta5")
-    implementation("com.google.mlkit:pose-detection-accurate:18.0.0-beta5")
+    implementation("com.google.mlkit:pose-detection:17.0.0")
+    implementation("com.google.mlkit:pose-detection-accurate:17.0.0")
 
-    // Other libraries
     implementation("com.google.code.gson:gson:2.10.1")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.0")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
 
-    // Testing
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.ui.test.junit4)
-
-    // Debugging
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
 }

@@ -1,3 +1,5 @@
 <resources>
+    <string name="accessibility_service_description">Monitors opened apps to enforce focus with push-up unlocks.</string>
+
     <string name="app_name">Pushup Lock</string>
 </resources>

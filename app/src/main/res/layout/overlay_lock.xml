@@ -18,20 +18,19 @@
             android:textSize="18sp"
             android:padding="8dp"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"/>
+            android:layout_height="wrap_content" />
 
         <Button
             android:id="@+id/start_pushups"
             android:text="Start Push-ups"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"/>
+            android:layout_height="wrap_content" />
 
         <Button
             android:id="@+id/btn_close"
             android:text="Cancel"
             android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:onClick="closeOverlay"/>
+            android:layout_height="wrap_content" />
 
     </LinearLayout>
 </FrameLayout>

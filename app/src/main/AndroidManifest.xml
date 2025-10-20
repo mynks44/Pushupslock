@@ -4,9 +4,18 @@
     package="com.example.pushuplock">
 
     <!-- Permissions -->
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
     <!-- Permission for listing installed apps (required on Android 11 and higher) -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
+
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:allowBackup="true"
@@ -34,6 +43,7 @@
         <!-- PushUpActivity -->
         <activity android:name=".PushUpActivity" />
 
+        <!-- Accessibility watcher -->
         <service
             android:name=".AppMonitorService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
@@ -43,12 +53,17 @@
             </intent-filter>
             <meta-data
                 android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_service_config" />
+                android:resource="@xml/accessibility_service_config"/>
         </service>
 
+        <!-- Overlay / countdown service -->
         <service
             android:name=".LockOverlayService"
-            android:exported="false" />
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection"
+            tools:ignore="ForegroundServicePermission">
+            <!-- foregroundServiceType is mostly a hint; pick any neutral type -->
+        </service>
 
     </application>
 
