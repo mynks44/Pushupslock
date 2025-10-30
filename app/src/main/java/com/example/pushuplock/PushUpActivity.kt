@@ -25,16 +25,41 @@ import com.google.mlkit.vision.pose.PoseLandmark
 import com.google.mlkit.vision.pose.accurate.AccuratePoseDetectorOptions
 import kotlin.math.*
 
+private fun dist(ax: Float, ay: Float, bx: Float, by: Float): Float {
+    val dx = ax - bx; val dy = ay - by
+    return kotlin.math.sqrt(dx*dx + dy*dy)
+}
+private fun dist(a: PoseLandmark?, b: PoseLandmark?): Float {
+    if (a == null || b == null) return 0f
+    return dist(a.position.x, a.position.y, b.position.x, b.position.y)
+}
+
+
 class PushUpActivity : AppCompatActivity() {
 
-    private val CALIB_MS = 900L          // time to learn your TOP pose
-    private val HOLD_MS = 180L           // minimum bottom hold
-    private val READY_THRESH = 0.92f     // readiness gate (0..1) to start
-    private val PUSH_THRESH = 0.65       // push probability to accept DOWN
-    private val ALPHA = 0.28f             // smoothing (higher = snappier)
+    // ===== Tunables (safe defaults) =====
+// ===== Tunables (distance-agnostic) =====
+    private val CALIB_TOP_MS = 900L
+    private val HOLD_BOTTOM_MS = 180L
+    private val EMA_ALPHA_POS = 0.28f
+    private val EMA_ALPHA_ANG = 0.28f
 
-    private val DOWN_FRACTION = 0.13f    // how far nose must go down from TOP
-    private val UP_FRACTION   = 0.05f    // how close back to TOP to finish rep
+    // readiness / gating (more tolerant but robust)
+    private val READY_THRESH = 0.70f
+    private val MIN_TORSO_ANGLE = 110.0
+    private val PUSH_PROB_THRESH = 0.50
+
+// down = how far nose should travel relative to shoulder width
+// up   = hysteresis band
+    private val K_DOWN_FROM_SHOULDER = 2.1f   // ~2.1 × shoulder width
+    private val K_UP_FROM_SHOULDER   = 0.55f  // ~0.55 × shoulder width
+
+    // clamps (so thresholds never become crazy)
+    private val MIN_DOWN_PX = 12f
+    private val MAX_DOWN_FRAC_OF_IMG = 0.30f
+    private val MIN_UP_PX = 8f
+    private val MAX_UP_FRAC_OF_IMG = 0.15f
+       // back-up threshold (of height)
 
     private lateinit var previewView: PreviewView
     private lateinit var overlay: PoseOverlay
@@ -42,36 +67,37 @@ class PushUpActivity : AppCompatActivity() {
     private lateinit var tvEarned: TextView
     private lateinit var tvHint: TextView
     private lateinit var tvDebug: TextView
+    private lateinit var tvHud: TextView
 
     private val exec = java.util.concurrent.Executors.newSingleThreadExecutor()
     private lateinit var detector: PoseDetector
-    private var camera: Camera? = null
 
-    // ---------- App lock plumbing ----------
     private var targetPackage: String? = null
 
-    private enum class Phase { CALIB, WAIT_READY, UP, DOWN }
-    private var phase = Phase.CALIB
+    private enum class Phase { CALIB_TOP, WAIT_READY, UP, DESCENT, BOTTOM_HOLD, ASCENT }
+    private var phase = Phase.CALIB_TOP
     private var reps = 0
     private var secondsGranted = 0
 
-    // ---------- Geometry / thresholds ----------
-    private var imgW = 0; private var imgH = 0
-    private var downDeltaPx = 0f
-    private var upDeltaPx = 0f
-
-    // ---------- Calibration / smoothing ----------
-    private var t0 = 0L
+    // ===== Geometry =====
+    private var imgH = 0
+    private var downPx = 0f
+    private var upPx = 0f
     private var topNoseY = Float.NaN
     private var sNoseY = Float.NaN
+    private var sElbowAngle = 170.0
+    private var sTorsoAngle = 170.0 // angle between shoulder–hip
+
+    private var t0 = 0L
     private var lastTs = 0L
     private var bottomTs = 0L
-    private var sElbowAngle = 170.0
 
-    private val camPerm =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-            if (ok) startCamera() else finish()
-        }
+    private var learnedBottomDelta = Float.NaN   // how far down from top was the first true bottom
+    private val BOTTOM_ADAPT_RATE = 0.10f        // slow adapt to new bottoms
+
+    private val camPerm = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
+        if (ok) startCamera() else finish()
+    }
 
     private fun now() = System.currentTimeMillis()
     private fun vib(ms: Int = 25) {
@@ -83,6 +109,7 @@ class PushUpActivity : AppCompatActivity() {
         } catch (_: Exception) {}
     }
     private fun lerp(a: Double, b: Double, t: Double) = a + (b - a) * t
+    private fun clamp01(x: Double) = x.coerceIn(0.0, 1.0)
 
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -95,6 +122,7 @@ class PushUpActivity : AppCompatActivity() {
         tvEarned = findViewById(R.id.tvEarned)
         tvHint = findViewById(R.id.tvHint)
         tvDebug = findViewById(R.id.tvDebug)
+        tvHud = findViewById(R.id.tvHud)
 
         targetPackage = intent.getStringExtra(LockOverlayService.EXTRA_TARGET_PACKAGE)
             ?: intent.getStringExtra("targetPackage")
@@ -113,8 +141,9 @@ class PushUpActivity : AppCompatActivity() {
         detector = PoseDetection.getClient(opts)
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED
-        ) startCamera() else camPerm.launch(Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED) {
+            startCamera()
+        } else camPerm.launch(Manifest.permission.CAMERA)
 
         tvReps.text = "Reps: 0"
         tvEarned.text = "Earned: 0m"
@@ -132,120 +161,169 @@ class PushUpActivity : AppCompatActivity() {
             }
             val analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build().also {
-                    it.setAnalyzer(exec) { px -> analyze(px) }
+                .build().also { ia ->
+                    ia.setAnalyzer(exec) { px -> analyze(px) }
                 }
 
             provider.unbindAll()
-            camera = provider.bindToLifecycle(
+            provider.bindToLifecycle(
                 this,
                 CameraSelector.DEFAULT_FRONT_CAMERA,
-                preview,
-                analysis
+                preview, analysis
             )
         }, ContextCompat.getMainExecutor(this))
     }
 
     private fun analyze(px: ImageProxy) {
-        imgW = px.width; imgH = px.height
-        if (downDeltaPx == 0f) {
-            downDeltaPx = imgH * DOWN_FRACTION
-            upDeltaPx   = imgH * UP_FRACTION
-        }
+        imgH = px.height
+//        if (downPx == 0f) {
+//            downPx = imgH * DOWN_FRACTION
+//            upPx   = imgH * UP_FRACTION
+//        }
 
         val media = px.image ?: run { px.close(); return }
         val input = InputImage.fromMediaImage(media, px.imageInfo.rotationDegrees)
-
         detector.process(input)
             .addOnSuccessListener { pose -> onPose(pose) }
             .addOnFailureListener { e -> Log.e("PushUp", "pose fail", e) }
             .addOnCompleteListener { px.close() }
     }
 
-    // ===================== Pose logic =====================
 
     private fun onPose(pose: Pose) {
         val nose = pose.getPoseLandmark(PoseLandmark.NOSE) ?: run {
-            overlay.update(null, 0f, calibrated = (phase != Phase.CALIB), status = "No face", statusColor = Color.RED)
+            overlay.update(null, 0f, calibrated = (phase != Phase.CALIB_TOP), status = "No face", statusColor = Color.RED)
+            tvHud.text = "face:0 | elbows:0 | torso:- | depth:- | vel:- | P:- | state:$phase | reps:$reps"
             return
         }
 
-        // elbows (optional but helpful)
         val Ls = pose.getPoseLandmark(PoseLandmark.LEFT_SHOULDER)
         val Le = pose.getPoseLandmark(PoseLandmark.LEFT_ELBOW)
         val Lw = pose.getPoseLandmark(PoseLandmark.LEFT_WRIST)
         val Rs = pose.getPoseLandmark(PoseLandmark.RIGHT_SHOULDER)
         val Re = pose.getPoseLandmark(PoseLandmark.RIGHT_ELBOW)
         val Rw = pose.getPoseLandmark(PoseLandmark.RIGHT_WRIST)
-        val leftOK = Ls != null && Le != null && Lw != null
-        val rightOK = Rs != null && Re != null && Rw != null
-        val angL = if (leftOK) elbowAngle(Ls!!, Le!!, Lw!!) else null
-        val angR = if (rightOK) elbowAngle(Rs!!, Re!!, Rw!!) else null
-        val elbowAngle = when {
-            angL != null && angR != null -> max(angL, angR)
-            angL != null -> angL
-            angR != null -> angR
-            else -> 170.0
+        val Lh = pose.getPoseLandmark(PoseLandmark.LEFT_HIP)
+        val Rh = pose.getPoseLandmark(PoseLandmark.RIGHT_HIP)
+
+        val elbowsOK = (Ls!=null && Le!=null && Lw!=null) || (Rs!=null && Re!=null && Rw!=null)
+        val torsoOK  = (Ls!=null && Lh!=null) && (Rs!=null && Rh!=null)
+
+        fun d(a: PoseLandmark?, b: PoseLandmark?): Float {
+            if (a == null || b == null) return 0f
+            val dx = a.position.x - b.position.x
+            val dy = a.position.y - b.position.y
+            return kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat()
         }
+
+        var scale = d(Ls, Rs)
+        if (scale <= 0f) {
+            val sh = d(Ls, Lh)
+            val rh = d(Rs, Rh)
+            scale = if (sh > 0f && rh > 0f) (sh + rh) * 0.5f else 0f
+        }
+
+        val K_DOWN_FROM_SHOULDER = 2.1f     // how far to travel down relative to shoulder width
+        val K_UP_FROM_SHOULDER   = 0.55f    // hysteresis band near top
+        val MIN_DOWN_PX = 12f
+        val MIN_UP_PX   = 8f
+        val MAX_DOWN_FRAC_OF_IMG = 0.30f
+        val MAX_UP_FRAC_OF_IMG   = 0.15f
+
+        if (imgH == 0) imgH = previewView.height
+
+        if (scale > 0f && imgH > 0) {
+            val imgCapDown = imgH * MAX_DOWN_FRAC_OF_IMG
+            val imgCapUp   = imgH * MAX_UP_FRAC_OF_IMG
+
+            var downTarget = K_DOWN_FROM_SHOULDER * scale
+            var upTarget   = K_UP_FROM_SHOULDER   * scale
+
+            downTarget = downTarget.coerceAtLeast(MIN_DOWN_PX).coerceAtMost(imgCapDown)
+            upTarget   = upTarget.coerceAtLeast(MIN_UP_PX).coerceAtMost(imgCapUp)
+
+            if (downPx == 0f) {
+                downPx = downTarget
+                upPx = upTarget
+            } else {
+                downPx = 0.20f * downTarget + 0.80f * downPx
+                upPx   = 0.20f * upTarget   + 0.80f * upPx
+            }
+        }
+
+        val elbowAng = max(
+            elbowsOK.let { if (Ls!=null && Le!=null && Lw!=null) elbowAngle(Ls,Le,Lw) else 0.0 },
+            elbowsOK.let { if (Rs!=null && Re!=null && Rw!=null) elbowAngle(Rs,Re,Rw) else 0.0 }
+        ).let { if (it==0.0) 170.0 else it }
+
+        val torsoAng = if (torsoOK) {
+            val a = if (Ls!=null && Lh!=null) shoulderHipAngle(Ls, Lh) else 180.0
+            val b = if (Rs!=null && Rh!=null) shoulderHipAngle(Rs, Rh) else 180.0
+            max(a, b)
+        } else 180.0
 
         val y = nose.position.y
         if (sNoseY.isNaN()) sNoseY = y
-        sNoseY = (ALPHA * y + (1f - ALPHA) * sNoseY)
-
-        sElbowAngle = ALPHA * elbowAngle + (1f - ALPHA) * sElbowAngle
-
+        sNoseY      = EMA_ALPHA_POS * y + (1f - EMA_ALPHA_POS) * sNoseY
+        sElbowAngle = EMA_ALPHA_ANG * elbowAng + (1f - EMA_ALPHA_ANG) * sElbowAngle
+        sTorsoAngle = EMA_ALPHA_ANG * torsoAng + (1f - EMA_ALPHA_ANG) * sTorsoAngle
 
         val t = now()
         if (lastTs == 0L) lastTs = t
         val dt = (t - lastTs).coerceAtLeast(16)
         lastTs = t
 
+        val top = if (topNoseY.isNaN()) sNoseY else topNoseY
+        val relY = sNoseY - top
+        val vDown = relY / dt.toDouble()
+
+        val downAmt = clamp01(relY / max(1f, downPx).toDouble())
+        val bendAmt = clamp01((170.0 - sElbowAngle) / 50.0)
+        val velAmt  = clamp01((vDown - 0.001) / 0.004)
+        val pushProb = (0.5 * downAmt + 0.3 * bendAmt + 0.2 * velAmt)
+
+        val nearTop       = clamp01(1.0 - abs(relY / (upPx * 5)))
+        val straightArms  = clamp01((sElbowAngle - 145.0) / 20.0)
+        val straightTorso = clamp01((sTorsoAngle - MIN_TORSO_ANGLE) / (180.0 - MIN_TORSO_ANGLE))
+        val readiness     = (0.6 * nearTop + 0.3 * straightArms + 0.1 * straightTorso).toFloat()
+
+        // overlay
+        val label = if (pushProb >= PUSH_PROB_THRESH)
+            "Pushing (%.2f)".format(pushProb)
+        else
+            "Not pushing (%.2f)".format(pushProb)
+
+        overlay.update(
+            pose = pose,
+            readiness = readiness,
+            calibrated = (phase != Phase.CALIB_TOP),
+            status = label,
+            statusColor = if (pushProb >= PUSH_PROB_THRESH) Color.GREEN else Color.RED
+        )
+
+        // HUD
+        tvHud.text = "face:1 | elbows:${if (elbowsOK)1 else 0} | torso:${"%.0f".format(sTorsoAngle)} " +
+                "| depth:${"%.0f".format(relY)} | vel:${"%.3f".format(vDown)} | P:${"%.2f".format(pushProb)} " +
+                "| state:$phase | reps:$reps"
+
         when (phase) {
-            Phase.CALIB -> {
+            Phase.CALIB_TOP -> {
                 if (topNoseY.isNaN()) topNoseY = sNoseY
-                topNoseY = lerp(topNoseY.toDouble(), sNoseY.toDouble(), 0.10).toFloat()
-                val left = (CALIB_MS - (t - t0)).coerceAtLeast(0)
+                topNoseY = (0.10 * sNoseY + 0.90 * topNoseY).toFloat()
+                val left = (CALIB_TOP_MS - (t - t0)).coerceAtLeast(0)
                 tvHint.text = "Calibrating… ${left}ms"
-                overlay.update(pose, readiness = 0f, calibrated = false, status = "Calibrating", statusColor = Color.YELLOW)
-                if (t - t0 >= CALIB_MS) {
+                if (t - t0 >= CALIB_TOP_MS) {
                     phase = Phase.WAIT_READY
                     tvHint.text = "Align until bar is GREEN, then go"
                     vib(15)
                 }
                 return
             }
-            else -> { /* continue */ }
-        }
 
-        // readiness score: near-top + elbows mostly straight + face seen
-        val straightAmt = ((sElbowAngle - 145.0) / 20.0).coerceIn(0.0, 1.0)               // 0..1
-        val topAmt = (1.0 - (abs((sNoseY - topNoseY).toDouble()) / (upDeltaPx * 5))).coerceIn(0.0, 1.0)
-        val handsOK = if (leftOK || rightOK) 1.0 else 0.6
-        val readiness = (0.5 * topAmt + 0.3 * straightAmt + 0.2 * handsOK).toFloat()
-
-        // push probability: down amount + elbow bend + downward velocity
-        val downAmt = ((sNoseY - topNoseY) / max(1f, downDeltaPx)).toDouble().coerceIn(0.0, 2.0) // 0..2
-        val bendAmt = ((170.0 - sElbowAngle) / 50.0).coerceIn(0.0, 1.0)
-        val vDown = (sNoseY - topNoseY) / dt.toDouble() // >0 means moving down
-        val velAmt = ((vDown - 0.001) / 0.004).coerceIn(0.0, 1.0)
-        val pushProb = (0.5 * downAmt + 0.3 * bendAmt + 0.2 * velAmt).coerceIn(0.0, 1.0)
-
-        val status = if (pushProb >= PUSH_THRESH) "Pushing (%.2f)".format(pushProb)
-        else "Not pushing (%.2f)".format(pushProb)
-        val statusColor = if (pushProb >= PUSH_THRESH) Color.GREEN else Color.RED
-        val calibratedFlag = phase != Phase.CALIB
-
-        overlay.update(
-            pose = pose,
-            readiness = readiness,
-            calibrated = calibratedFlag,
-            status = status,
-            statusColor = statusColor
-        )
-
-        when (phase) {
             Phase.WAIT_READY -> {
-                if (readiness >= READY_THRESH) {
+                val pass = readiness >= 0.70f
+                val fallback = (sElbowAngle >= 165.0 && abs(relY) <= upPx * 3)
+                if (pass || fallback) {
                     phase = Phase.UP
                     tvHint.text = "Ready ✓  Go DOWN"
                     vib(15)
@@ -253,33 +331,56 @@ class PushUpActivity : AppCompatActivity() {
             }
 
             Phase.UP -> {
-                val movedDown = (sNoseY - topNoseY) > downDeltaPx
-                if (movedDown && pushProb >= PUSH_THRESH) {
-                    phase = Phase.DOWN
+                val movedDown = relY > downPx * 0.9f
+                val torsoOk = sTorsoAngle >= MIN_TORSO_ANGLE - 10.0
+                if ((movedDown && pushProb >= PUSH_PROB_THRESH && torsoOk) || relY > downPx * 1.2f) {
+                    phase = Phase.DESCENT
                     bottomTs = t
-                    tvHint.text = "Hold…"
                 }
             }
 
-            Phase.DOWN -> {
-                val held = (t - bottomTs) >= HOLD_MS
-                val nearTop = (topNoseY - sNoseY) > -upDeltaPx  // sNoseY <= top + upDelta
-                if (held && nearTop) {
+            Phase.DESCENT -> {
+                val bottomLikely = vDown < 0.0005 || relY > downPx * 1.25f
+                if (bottomLikely) {
+                    phase = Phase.BOTTOM_HOLD
+                    bottomTs = t
+                    val targetBottom = max(relY, downPx)
+                    learnedBottomDelta = if (learnedBottomDelta.isNaN())
+                        targetBottom
+                    else
+                        0.90f * learnedBottomDelta + 0.10f * targetBottom
+                }
+            }
+
+            Phase.BOTTOM_HOLD -> {
+                if (t - bottomTs >= HOLD_BOTTOM_MS) {
+                    phase = Phase.ASCENT
+                }
+            }
+
+            Phase.ASCENT -> {
+                val backNearTop = relY <= upPx
+                if (backNearTop) {
+                    if (!learnedBottomDelta.isNaN()) {
+                        downPx = 0.80f * downPx + 0.20f * learnedBottomDelta
+                    }
                     onRep()
-                    topNoseY = lerp(topNoseY.toDouble(), sNoseY.toDouble(), 0.15).toFloat()
                     phase = Phase.UP
                     tvHint.text = "Up ✓  Go again"
                 }
             }
-
-            else -> Unit
         }
 
-        tvDebug.text = "state=$phase  Δdown=%.0f  downPx=%.0f  upPx=%.0f  angle=%.1f  P=%.2f  R=%.2f"
-            .format((sNoseY - topNoseY), downDeltaPx, upDeltaPx, sElbowAngle, pushProb, readiness)
+        tvDebug.text = "state=$phase Δdown=${"%.0f".format(sNoseY - (if (topNoseY.isNaN()) sNoseY else topNoseY))} " +
+                "downPx=${"%.0f".format(downPx)} upPx=${"%.0f".format(upPx)} " +
+                "angE=${"%.1f".format(sElbowAngle)} angT=${"%.1f".format(sTorsoAngle)} " +
+                "P=${"%.2f".format(pushProb)}"
     }
 
+
     private fun onRep() {
+
+
         reps++
         vib()
         tvReps.text = "Reps: $reps"
@@ -290,26 +391,34 @@ class PushUpActivity : AppCompatActivity() {
         secondsGranted += grant
         tvEarned.text = "Earned: ${secondsGranted / 60}m"
 
-        // tell overlay to add time
+        // grant time to overlay
         sendBroadcast(Intent(LockOverlayService.ACTION_GRANT_TIME).apply {
             putExtra(LockOverlayService.EXTRA_TARGET_PACKAGE, pkg)
             putExtra("grantSeconds", grant)
         })
-    }
 
+        // Want instant unlock on first rep? Uncomment:
+        // finish()
+    }
 
     private fun elbowAngle(s: PoseLandmark, e: PoseLandmark, w: PoseLandmark): Double {
         val ax = s.position.x - e.position.x
         val ay = s.position.y - e.position.y
         val bx = w.position.x - e.position.x
         val by = w.position.y - e.position.y
-        val dot = (ax * bx + ay * by)
-        val magA = sqrt((ax * ax + ay * ay).toDouble()).coerceAtLeast(1e-6)
-        val magB = sqrt((bx * bx + by * by).toDouble()).coerceAtLeast(1e-6)
+        val dot = ax*bx + ay*by
+        val magA = sqrt((ax*ax + ay*ay).toDouble()).coerceAtLeast(1e-6)
+        val magB = sqrt((bx*bx + by*by).toDouble()).coerceAtLeast(1e-6)
         val cos = (dot / (magA * magB)).coerceIn(-1.0, 1.0)
         return Math.toDegrees(acos(cos))
     }
 
+    private fun shoulderHipAngle(s: PoseLandmark, h: PoseLandmark): Double {
+        val dx = (h.position.x - s.position.x).toDouble()
+        val dy = (h.position.y - s.position.y).toDouble()
+        val theta = Math.toDegrees(atan2(dy, dx))
+        return 180.0 - abs(180.0 - abs(theta))
+    }
 
     override fun onDestroy() {
         super.onDestroy()

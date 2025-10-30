@@ -16,6 +16,17 @@
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
+    <TextView
+        android:id="@+id/tvHud"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:text="—"
+        android:textColor="#FFFFFF"
+        android:textSize="12sp"
+        android:padding="8dp"
+        android:background="#66000000" />
+
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -24,6 +35,7 @@
         android:padding="12dp"
         android:gravity="center_horizontal"
         android:background="#66000000">
+
         <TextView
             android:id="@+id/tvReps"
             android:layout_width="wrap_content"
@@ -33,6 +45,7 @@
             android:textSize="18sp"
             android:textColor="#FFFFFF"
             android:paddingEnd="16dp"/>
+
         <TextView
             android:id="@+id/tvEarned"
             android:layout_width="wrap_content"
@@ -62,5 +75,4 @@
         android:padding="6dp"
         android:background="#40000000"
         android:layout_gravity="bottom"/>
-
 </FrameLayout>
